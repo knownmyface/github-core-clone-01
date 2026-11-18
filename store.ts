@@ -200,6 +200,11 @@ export class Store {
   readonly epochBase: number;
   readonly viewerLogin: string = VIEWER.login;
   private filesCacheVersion = 0;
+  /** Parsed commits, cached by oid. A commit's bytes never change, so its parsed
+   * form never changes; this turns every repeat `commitOf` (planFetch walks,
+   * isDescendant checks, REST/GraphQL commit reads) from a re-parse into a Map
+   * lookup. Bounded by the number of distinct commits in the trial. */
+  private readonly parsedCommits = new Map<string, { tree: string; parents: string[]; message: string }>();
 
   constructor(options: { epochBase?: number } = {}) {
     this.epochBase = options.epochBase ?? parseTrialNow(process.env.MAKEFUN_TRIAL_NOW) ?? DEFAULT_EPOCH_SEC;
@@ -228,6 +233,12 @@ export class Store {
     const oid = hashObject(entry.type, entry.data);
     if (!this.objects.has(oid)) this.objects.set(oid, entry);
     return oid;
+  }
+
+  /** Store an object whose oid is already known (e.g. it came out of `readPack`, which
+   * computed the oid while parsing). Skips a redundant `hashObject` per object. */
+  putObjectEntryWithOid(oid: string, entry: GitObject): void {
+    if (!this.objects.has(oid)) this.objects.set(oid, entry);
   }
 
   hasObject(oid: string): boolean {
@@ -364,10 +375,14 @@ export class Store {
   // -----------------------------------------------------------------------------------------
 
   commitOf(oid: string): { tree: string; parents: string[]; message: string } | undefined {
+    const hit = this.parsedCommits.get(oid);
+    if (hit) return hit;
     const object = this.objects.get(oid);
     if (!object || object.type !== 'commit') return undefined;
     const parsed = parseCommit(object.data);
-    return { tree: parsed.tree, parents: parsed.parents, message: parsed.message };
+    const out = { tree: parsed.tree, parents: parsed.parents, message: parsed.message };
+    this.parsedCommits.set(oid, out);
+    return out;
   }
 
   treeEntries(oid: string): TreeEntry[] | undefined {
@@ -440,8 +455,10 @@ export class Store {
     const out: { sha: string; message: string; parents: string[] }[] = [];
     const seen = new Set<string>();
     const queue = [tip];
-    while (queue.length) {
-      const oid = queue.shift()!;
+    // Index pointer instead of shift(): shift() is O(n) per pop, which makes a
+    // long history walk quadratic.
+    for (let head = 0; head < queue.length; head += 1) {
+      const oid = queue[head];
       if (seen.has(oid)) continue;
       seen.add(oid);
       const commit = this.commitOf(oid);

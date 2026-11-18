@@ -14,6 +14,7 @@ import {
   pktLineFlush,
   readPack,
   writePack,
+  writePackFromMap,
   type GitObject,
   type GitPacket,
   type GitObjectType,
@@ -386,7 +387,7 @@ export function buildFetchResponse(plan: FetchPlan): Buffer {
   parts.push(pktLineFlush());
   // packfile
   parts.push(encodePktLine('packfile\n'));
-  const pack = writePack(plan.objectsToSend.values());
+  const pack = writePackFromMap(plan.objectsToSend);
   parts.push(sidebandPack(pack));
   parts.push(pktLineFlush());
   return Buffer.concat(parts);
@@ -430,7 +431,9 @@ export interface PushResult {
  * A refused ref never moves, but its objects are still stored.
  */
 export function applyPush(store: Store, repo: Repo, commands: PushCommand[], packObjects: Map<string, GitObject>): PushResult {
-  for (const object of packObjects.values()) store.putObjectEntry(object);
+  // `packObjects` is keyed by oid (readPack computed it), so store each object under
+  // its known oid instead of re-hashing it.
+  for (const [oid, object] of packObjects) store.putObjectEntryWithOid(oid, object);
   const results: Array<{ ref: string; ok: boolean; reason?: string }> = [];
   let allOk = true;
   for (const command of commands) {

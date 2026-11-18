@@ -85,9 +85,10 @@ export function createGitCaches(): GitCaches {
 }
 
 /** The fast path for GET /api/v3/repos/{owner}/{repo}/issues/{number}: a pre-serialized
- * JSON string, cached per (repo, number, issueVersion). */
+ * JSON Buffer, cached per (repo, number, issueVersion). A Buffer (not a string) so the
+ * hot path sends it with no per-request byteLength or string->Buffer conversion. */
 interface IssueCache {
-  readonly entries: Map<string, { version: number; json: string }>;
+  readonly entries: Map<string, { version: number; json: Buffer }>;
 }
 
 export function createIssueCache(): IssueCache {
@@ -103,14 +104,41 @@ interface RouteContext {
 }
 
 function gitPathMatch(path: string): { owner: string; repo: string; suffix: string } | undefined {
+  // Fast reject: a git path always contains ".git". REST/GraphQL/MCP paths never do,
+  // so this skips the regex for the overwhelmingly common non-git requests.
+  if (!path.includes('.git')) return undefined;
   const match = /^\/([^/]+)\/([^/]+)\.git(\/.*)?$/.exec(path);
   if (!match) return undefined;
   return { owner: match[1], repo: match[2], suffix: match[3] ?? '' };
 }
 
+/** Read one query parameter from a raw query string (no leading '?'). Returns the raw
+ * (percent-decoded if it contains '%') value, or null. Only used for the git `service`
+ * parameter, whose value is a fixed token, so this stays cheap. */
+function queryParam(query: string, name: string): string | null {
+  const needle = `${name}=`;
+  let at = query.indexOf(needle);
+  while (at >= 0) {
+    if (at === 0 || query[at - 1] === '&') {
+      let end = query.indexOf('&', at + needle.length);
+      if (end < 0) end = query.length;
+      const raw = query.slice(at + needle.length, end);
+      return raw.includes('%') ? decodeURIComponent(raw) : raw;
+    }
+    at = query.indexOf(needle, at + 1);
+  }
+  return null;
+}
+
 async function handleRequest(context: RouteContext, request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const url = new URL(request.url ?? '/', 'http://127.0.0.1');
-  const path = url.pathname;
+  // Cheap path parse: `new URL` costs ~1.8 us and allocates per request, and the hot
+  // paths (git + the issue fast path) never need the query object. Split on '?' and
+  // only build a URL in the generic REST branch, which is the only place that reads
+  // searchParams.
+  const rawUrl = request.url ?? '/';
+  const qIndex = rawUrl.indexOf('?');
+  const path = qIndex < 0 ? rawUrl : rawUrl.slice(0, qIndex);
+  const queryString = qIndex < 0 ? '' : rawUrl.slice(qIndex + 1);
   const method = request.method ?? 'GET';
 
   try {
@@ -130,7 +158,7 @@ async function handleRequest(context: RouteContext, request: IncomingMessage, re
       const repo = requireGitRepo(context.store, gitPath.owner, gitPath.repo);
       const cacheKey = `${repo.fullName}@${repo.refVersion}`;
       if (method === 'GET' && gitPath.suffix === '/info/refs') {
-        const service = url.searchParams.get('service');
+        const service = queryParam(queryString, 'service');
         if (service !== 'git-upload-pack' && service !== 'git-receive-pack') {
           sendError(response, 400, 'service is required');
           return;
@@ -233,17 +261,17 @@ async function handleRequest(context: RouteContext, request: IncomingMessage, re
           const payload = cached.json;
           response.writeHead(200, {
             'Content-Type': JSON_CONTENT_TYPE,
-            'Content-Length': Buffer.byteLength(payload),
+            'Content-Length': payload.length,
             'X-GitHub-Request-Id': nextRequestId(),
           });
           response.end(payload);
           return;
         }
-        const json = JSON.stringify(issueJson(repo, issue));
+        const json = Buffer.from(JSON.stringify(issueJson(repo, issue)));
         context.issueCache.entries.set(key, { version: repo.issueVersion, json });
         response.writeHead(200, {
           'Content-Type': JSON_CONTENT_TYPE,
-          'Content-Length': Buffer.byteLength(json),
+          'Content-Length': json.length,
           'X-GitHub-Request-Id': nextRequestId(),
         });
         response.end(json);
@@ -267,6 +295,9 @@ async function handleRequest(context: RouteContext, request: IncomingMessage, re
           throw error;
         }
       }
+      // Only the generic REST handler reads query parameters, so the URL is built
+      // here, not on every request.
+      const url = new URL(request.url ?? '/', 'http://127.0.0.1');
       const result = await matched.handler(context.store, {
         params: matched.params,
         query: url.searchParams,
@@ -307,6 +338,12 @@ export function createApp(): ReturnType<typeof createServer> {
   };
   const server = createServer((request, response) => {
     void handleRequest(context, request, response);
+  });
+  // Disable Nagle: the bench is thousands of small request/response pairs, and
+  // Nagle's coalescing delay would add latency to every one. Node enables it by
+  // default on server sockets; turning it off is the standard low-latency choice.
+  server.on('connection', (socket) => {
+    socket.setNoDelay(true);
   });
   server.keepAliveTimeout = 60_000;
   server.headersTimeout = 65_000;
